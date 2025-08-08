@@ -9,7 +9,7 @@ import shutil
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from PIL import Image
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel, AutoModel, AutoProcessor, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 
 app = FastAPI()
@@ -44,6 +44,12 @@ SUPPORTED_MODELS = {
     "mpnet": {
         "full_name": "sentence-transformers/all-mpnet-base-v2",
         "type": "sentence_transformer"
+    },
+    "git": {
+        "full_name": "microsoft/git-base-coco",
+        "type": "caption",
+        "processor_class": AutoProcessor,
+        "model_class": AutoModelForCausalLM
     }
 }
 
@@ -80,6 +86,11 @@ def load_model(alias_name: str):
             # Simplify loading by using the SentenceTransformer library
             model = SentenceTransformer(full_model_name)
             loaded_models[alias_name] = {"model": model, "type": "sentence_transformer"}
+
+        elif model_info["type"] == "caption":
+            processor = model_info["processor_class"].from_pretrained(full_model_name)
+            model = model_info["model_class"].from_pretrained(full_model_name)
+            loaded_models[alias_name] = {"processor": processor, "model": model, "type": "caption"}
 
         else:
             raise ValueError(f"Unknown model type for {full_model_name}: {model_info['type']}")
@@ -164,6 +175,33 @@ async def get_vector_from_text(request: TextRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing text: {str(e)}")
+
+
+@app.post("/caption")
+async def generate_caption(request: ImageRequest, model_alias: str = "git"):
+    if not request.image:
+        raise HTTPException(status_code=400, detail="No image data provided")
+
+    model_info = SUPPORTED_MODELS.get(model_alias)
+    if not model_info or model_info["type"] != "caption":
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' is not a supported captioning model.")
+
+    try:
+        caption_components = load_model(model_alias)
+        processor = caption_components["processor"]
+        model = caption_components["model"]
+
+        image_bytes = base64.b64decode(request.image)
+        image = Image.open(io.BytesIO(image_bytes))
+
+        inputs = processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            generated_ids = model.generate(pixel_values=inputs.pixel_values, max_length=50)
+
+        generated_caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return generated_caption
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating caption: {str(e)}")
 
 
 if __name__ == "__main__":
