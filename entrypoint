@@ -1,60 +1,170 @@
 #!/usr/bin/env python3
 import io
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import base64
-from PIL import Image
 import torch
-from transformers import CLIPProcessor, CLIPModel
 import uvicorn
+import concurrent.futures
+import os
+import shutil
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+from sentence_transformers import SentenceTransformer
 
 app = FastAPI()
 
-##clip_model = CLIPModel.from_pretrained("wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
-##clip_processor = CLIPProcessor.from_pretrained("wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
-
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+MIN_DISK_SPACE = 1024 * 1024 * 1024  # 1 GB in bytes
 
 
+# --- Model Loading and Caching ---
+loaded_models = {}
+
+SUPPORTED_MODELS = {
+    "clip": {
+        "full_name": "openai/clip-vit-base-patch32",
+        "type": "clip",
+        "processor_class": CLIPProcessor,
+        "model_class": CLIPModel
+    },
+    "tinyclip": {
+        "full_name": "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M",
+        "type": "clip",
+        "processor_class": CLIPProcessor,
+        "model_class": CLIPModel
+    },
+    "bge": {
+        "full_name": "BAAI/bge-small-en-v1.5",
+        "type": "sentence_transformer" # Use SentenceTransformer for AutoModels
+    },
+    "minilm": {
+        "full_name": "sentence-transformers/all-MiniLM-L6-v2",
+        "type": "sentence_transformer" # Use SentenceTransformer for AutoModels
+    },
+    "mpnet": {
+        "full_name": "sentence-transformers/all-mpnet-base-v2",
+        "type": "sentence_transformer"
+    }
+}
+
+DEFAULT_CLIP_MODEL_ALIAS = "clip"
+
+def load_model(alias_name: str):
+    """Loads a model and its corresponding components using the alias."""
+    if alias_name not in loaded_models:
+        model_info = SUPPORTED_MODELS.get(alias_name)
+        if not model_info:
+            raise ValueError(f"Model alias '{alias_name}' is not supported.")
+
+        # Get the path where models are stored (usually the home directory)
+        # We'll use the current directory as a safe default.
+        download_path = os.getcwd()
+
+        # Check for disk space
+        _, _, free_space = shutil.disk_usage(download_path)
+        if free_space < MIN_DISK_SPACE:
+            raise RuntimeError(
+                f"Insufficient disk space to download new model '{alias_name}'. "
+                f"Available: {free_space / (1024**3):.2f} GB, Required: 1.00 GB."
+            )
+
+        full_model_name = model_info["full_name"]
+        print(f"Loading model: {full_model_name} (alias: {alias_name})...")
+
+        if model_info["type"] == "clip":
+            processor = model_info["processor_class"].from_pretrained(full_model_name)
+            model = model_info["model_class"].from_pretrained(full_model_name)
+            loaded_models[alias_name] = {"processor": processor, "model": model, "type": "clip"}
+
+        elif model_info["type"] == "sentence_transformer":
+            # Simplify loading by using the SentenceTransformer library
+            model = SentenceTransformer(full_model_name)
+            loaded_models[alias_name] = {"model": model, "type": "sentence_transformer"}
+
+        else:
+            raise ValueError(f"Unknown model type for {full_model_name}: {model_info['type']}")
+        print(f"Model {full_model_name} loaded.")
+    return loaded_models[alias_name]
+
+# Load default CLIP model on startup
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    future = executor.submit(load_model, DEFAULT_CLIP_MODEL_ALIAS)
+    future.result()
+
+# --- Pydantic Models ---
 class ImageRequest(BaseModel):
-	image: str
+    image: str
+    model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a CLIP model alias for image encoding.")
 
 class TextRequest(BaseModel):
-	text: str
+    text: str
+    model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a text embedding model alias.")
 
+# --- API Endpoints ---
 @app.post("/image")
 async def get_vector_from_image(request: ImageRequest):
-	if not request.image:
-		raise HTTPException(status_code=400, detail="No image data provided")
+    if not request.image:
+        raise HTTPException(status_code=400, detail="No image data provided")
 
-	try:
-		image_bytes = base64.b64decode(request.image)
-		image = Image.open(io.BytesIO(image_bytes))
+    model_alias = request.model
+    model_info = SUPPORTED_MODELS.get(model_alias)
 
-		inputs = clip_processor(images=image, return_tensors="pt")
-		with torch.no_grad():
-			image_features = clip_model.get_image_features(**inputs)
+    if not model_info or model_info["type"] != "clip":
+        raise HTTPException(status_code=400, detail=f"Model '{model_alias}' does not support image encoding.")
 
-		return image_features.squeeze().tolist()
-	except Exception as e:
-		raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
+    try:
+        clip_components = load_model(model_alias)
+        clip_processor = clip_components["processor"]
+        clip_model = clip_components["model"]
+
+        image_bytes = base64.b64decode(request.image)
+        image = Image.open(io.BytesIO(image_bytes))
+
+        inputs = clip_processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            image_features = clip_model.get_image_features(**inputs)
+
+        return image_features.squeeze().tolist()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
 
 @app.post("/text")
 async def get_vector_from_text(request: TextRequest):
-	if not request.text:
-		raise HTTPException(status_code=400, detail="No text provided")
+    if not request.text:
+        raise HTTPException(status_code=400, detail="No text provided")
 
-	try:
-		inputs = clip_processor(text=[request.text], return_tensors="pt")
-		with torch.no_grad():
-			text_features = clip_model.get_text_features(**inputs)
+    model_alias = request.model
+    model_info = SUPPORTED_MODELS.get(model_alias)
 
-		return text_features.squeeze().tolist()
-	except Exception as e:
-		raise HTTPException(status_code=400, detail=f"Error processing text: {str(e)}")
+    if not model_info:
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' is not supported.")
+
+    try:
+        model_components = load_model(model_alias)
+        model_type = model_components["type"]
+
+        if model_type == "clip":
+            processor = model_components["processor"]
+            model = model_components["model"]
+            inputs = processor(text=[request.text], return_tensors="pt")
+            with torch.no_grad():
+                text_features = model.get_text_features(**inputs)
+            return text_features.squeeze().tolist()
+
+        elif model_type == "sentence_transformer":
+            # This is the simplified part!
+            model = model_components["model"]
+            # The encode method handles tokenization, forward pass, and pooling
+            embedding = model.encode(request.text, convert_to_tensor=False)
+            return embedding.tolist()
+
+        else:
+            raise HTTPException(status_code=500, detail=f"Unhandled model type: {model_type} for alias {model_alias}")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing text: {str(e)}")
 
 
 if __name__ == "__main__":
-	uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run(app, host="0.0.0.0", port=8000)
