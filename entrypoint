@@ -14,7 +14,7 @@ from sentence_transformers import SentenceTransformer
 
 app = FastAPI()
 
-MIN_DISK_SPACE = 1024 * 1024 * 1024  # 1 GB in bytes
+MIN_DISK_SPACE = 1024 * 1024 * 1024 * 2 # 2 GB in bytes (clip - via transformers, and git-base-code are jst over 1GB)
 
 
 # --- Model Loading and Caching ---
@@ -33,16 +33,20 @@ SUPPORTED_MODELS = {
         "processor_class": CLIPProcessor,
         "model_class": CLIPModel
     },
-    "bge": {
+    "bgesmall": {
         "full_name": "BAAI/bge-small-en-v1.5",
-        "type": "sentence_transformer" # Use SentenceTransformer for AutoModels
+        "type": "sentence_transformer"
+    },
+    "bge": {
+        "full_name": "BAAI/bge-m3",
+        "type": "sentence_transformer"
     },
     "minilm": {
-        "full_name": "sentence-transformers/all-MiniLM-L6-v2",
-        "type": "sentence_transformer" # Use SentenceTransformer for AutoModels
+        "full_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "type": "sentence_transformer"
     },
     "mpnet": {
-        "full_name": "sentence-transformers/all-mpnet-base-v2",
+        "full_name": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         "type": "sentence_transformer"
     },
     "git": {
@@ -51,6 +55,7 @@ SUPPORTED_MODELS = {
         "processor_class": AutoProcessor,
         "model_class": AutoModelForCausalLM
     }
+
 }
 
 DEFAULT_CLIP_MODEL_ALIAS = "clip"
@@ -106,6 +111,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
 class ImageRequest(BaseModel):
     image: str
     model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a CLIP model alias for image encoding.")
+    max_length: int = 50 # only used for caption endpoint
 
 class TextRequest(BaseModel):
     text: str
@@ -196,12 +202,20 @@ async def generate_caption(request: ImageRequest, model_alias: str = "git"):
 
         inputs = processor(images=image, return_tensors="pt")
         with torch.no_grad():
-            generated_ids = model.generate(pixel_values=inputs.pixel_values, max_length=50)
+            generated_ids = model.generate(
+		pixel_values=inputs.pixel_values,
+		max_length=request.max_length  # <-- Use the value from the request
+            )
 
         generated_caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return generated_caption
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating caption: {str(e)}")
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
