@@ -9,8 +9,23 @@ import shutil
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from PIL import Image
-from transformers import CLIPProcessor, CLIPModel, AutoModel, AutoProcessor, AutoModelForCausalLM
+from transformers import (
+    CLIPProcessor,
+    CLIPModel,
+    AutoProcessor,
+    AutoModelForCausalLM,
+    AutoTokenizer,  # New import for LLM tokenizer
+    BitsAndBytesConfig  # New import for quantization
+)
 from sentence_transformers import SentenceTransformer
+from huggingface_hub import login
+
+# Get the token from the environment variable
+access_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+# Log in to Hugging Face
+if access_token:
+    login(token=access_token)
 
 app = FastAPI()
 
@@ -54,8 +69,20 @@ SUPPORTED_MODELS = {
         "type": "caption",
         "processor_class": AutoProcessor,
         "model_class": AutoModelForCausalLM
+    },
+    "gemma270m": {
+        "full_name": "google/gemma-3-270m-it",
+        "type": "llm",
+        "tokenizer_class": AutoTokenizer, #good enough for text llm
+	"model_class": AutoModelForCausalLM
     }
-
+#    "gemma4b": {   -- running a full multimodel model is very differnet beast, likly not work without GPU
+#        "full_name": "google/gemma-3-4b-it",
+#        "type": "llm",
+#        "tokenizer_class": AutoTokenizer,
+#        "processor_class": AutoProcessor, #needed for multimodal
+#	"model_class": AutoModelForCausalLM
+#    }
 }
 
 DEFAULT_CLIP_MODEL_ALIAS = "clip"
@@ -97,6 +124,25 @@ def load_model(alias_name: str):
             model = model_info["model_class"].from_pretrained(full_model_name)
             loaded_models[alias_name] = {"processor": processor, "model": model, "type": "caption"}
 
+        elif model_info["type"] == "llm":
+            # quantization would be for the larger models! (to load them into GPU!)
+            # nf4_config = BitsAndBytesConfig(
+            #    load_in_4bit=True,
+            #    bnb_4bit_quant_type="nf4",
+            #    bnb_4bit_use_double_quant=True,
+            #    bnb_4bit_compute_dtype=torch.bfloat16
+            #)
+            model = AutoModelForCausalLM.from_pretrained(
+                full_model_name
+            #    quantization_config=nf4_config,
+            #    torch_dtype=torch.bfloat16
+            )
+            tokenizer = model_info["tokenizer_class"].from_pretrained(full_model_name)
+            loaded_models[alias_name] = {"tokenizer": tokenizer, "model": model, "type": "llm"}
+            if "processor_class" in model_info:
+                processor = model_info["processor_class"].from_pretrained(full_model_name)
+                loaded_models[alias_name]["processor"] = processor
+
         else:
             raise ValueError(f"Unknown model type for {full_model_name}: {model_info['type']}")
         print(f"Model {full_model_name} loaded.")
@@ -116,6 +162,12 @@ class ImageRequest(BaseModel):
 class TextRequest(BaseModel):
     text: str
     model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a text embedding model alias.")
+
+# New Pydantic class for LLM requests
+class LLMRequest(BaseModel):
+    text: str
+    image: str = None  # Optional image field
+    model: str = Query("gemma270m", description="Optional: Specify a LLM Model.")
 
 # --- API Endpoints ---
 @app.post("/image")
@@ -211,6 +263,118 @@ async def generate_caption(request: ImageRequest, model_alias: str = "git"):
         return generated_caption
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating caption: {str(e)}")
+
+
+@app.post("/generate")
+async def generate_llm_response(request: LLMRequest):
+    if not request.text:
+        raise HTTPException(status_code=400, detail="No text prompt provided.")
+
+    model_alias = request.model
+    model_info = SUPPORTED_MODELS.get(model_alias)
+
+    if not model_info or model_info["type"] != "llm":
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' is not supported.")
+
+    try:
+        full_prompt = request.text
+        if request.image:
+            # Decode the image and generate a caption
+            image_bytes = base64.b64decode(request.image)
+            image = Image.open(io.BytesIO(image_bytes))
+
+            caption_components = load_model("git")
+            processor = caption_components["processor"]
+            model = caption_components["model"]
+
+            # Use the existing smallcap model to describe the image
+            inputs = processor(images=image, return_tensors="pt")
+            with torch.no_grad():
+                generated_ids = model.generate(pixel_values=inputs.pixel_values, max_length=50)
+            image_caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+            # Combine the image caption with the user's text prompt
+            full_prompt = f"The image shows: {image_caption}. Based on the image, {request.text}"
+
+        # Format the prompt for the Gemma model
+        chat_prompt = f"<start_of_turn>user\n{full_prompt}<end_of_turn>\n<start_of_turn>model"
+
+        llm_components = load_model(model_alias)
+        tokenizer = llm_components["tokenizer"]
+        model = llm_components["model"]
+
+        # Tokenize the prompt
+        inputs = tokenizer(chat_prompt, return_tensors="pt")
+
+        # Store the number of tokens in the input prompt
+        input_length = inputs.input_ids.shape[1]
+
+        # Generate the response
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=1000, do_sample=True)
+
+        # Slice the tensor to get only the newly generated tokens
+        # The full output tensor starts with the input tokens, so we slice from
+        # input_length to the end of the tensor
+        generated_tokens = outputs[0, input_length:]
+
+        # Decode only the generated tokens
+        response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+        return {"response": response}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error generating LLM response: {str(e)}")
+
+
+@app.post("/multimodal-generate")
+async def multimodal_generate(request: LLMRequest):
+    if not request.text and not request.image:
+        raise HTTPException(status_code=400, detail="Please provide a text prompt or an image.")
+
+    model_alias = request.model
+    model_info = SUPPORTED_MODELS.get(model_alias)
+
+    if not model_info or model_info["type"] != "llm":
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' is not supported.")
+
+    if "processor_class" not in model_info and request.image:
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' does not support image inout, use /generate enpoint - which uses a caption model to read the image")
+
+    try:
+        llm_components = load_model(model_alias)
+        if "processor" not in llm_components:
+            processor = llm_components["tokenizer"] #the gemma270m model, only loads a tokenizer, which is ok if dont need image input
+        else:
+            processor = llm_components["processor"]
+        model = llm_components["model"]
+
+        if request.image:
+            image_bytes = base64.b64decode(request.image)
+            image = Image.open(io.BytesIO(image_bytes))
+
+            # The processor handles image resizing and token encoding
+            inputs = processor(text=request.text, images=image, return_tensors="pt")
+        else:
+            inputs = processor(text=request.text, return_tensors="pt")
+
+        # Move inputs to the same device as the model
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        # Generate the response
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, max_new_tokens=1000, do_sample=True)
+
+        # Decode the output
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        # Return only the model's response
+        # The prompt is included in the output, so we split it off
+        response = generated_text.split(request.text)[-1].strip()
+
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
 
 
 @app.get("/health")

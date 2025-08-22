@@ -11,7 +11,7 @@ def test_text_endpoint(input_text: str, model_alias: str):
     print(f"Testing /text endpoint with model '{model_alias}'...")
     payload = {
         "text": input_text,
-        "model_alias": model_alias
+        "model": model_alias
     }
     response = requests.post(f"{BASE_URL}/text", json=payload)
     handle_response(response)
@@ -22,7 +22,7 @@ def test_image_endpoint(image_path: str, model_alias: str):
     if not os.path.exists(image_path):
         print(f"Error: Image file not found at '{image_path}'")
         return
-        
+
     try:
         with open(image_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
@@ -32,12 +32,12 @@ def test_image_endpoint(image_path: str, model_alias: str):
 
     payload = {
         "image": encoded_string,
-        "model_alias": model_alias
+        "model": model_alias
     }
     response = requests.post(f"{BASE_URL}/image", json=payload)
     handle_response(response)
 
-def test_caption_endpoint(image_path: str):
+def test_caption_endpoint(image_path: str, max_length: int):
     """Tests the /caption endpoint with a local image file."""
     print("Testing /caption endpoint...")
     if not os.path.exists(image_path):
@@ -50,13 +50,19 @@ def test_caption_endpoint(image_path: str):
     except IOError:
         print(f"Error: Could not read image file at '{image_path}'")
         return
-        
+
     # The caption endpoint uses a hardcoded model, so we don't pass an alias.
     payload = {
-        "image": encoded_string
+        "image": encoded_string,
+        "max_length": max_length
     }
-    response = requests.post(f"{BASE_URL}/caption", json=payload)
-    handle_response(response)
+    try:
+        response = requests.post(f"{BASE_URL}/caption", json=payload)
+        response.raise_for_status()
+        caption = response.json()
+        print(f"Caption (max_length={max_length}): {caption}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error testing caption endpoint: {e}")
 
 def handle_response(response):
     """Prints the response from the API or an error message."""
@@ -88,11 +94,14 @@ def handle_response(response):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test FastAPI endpoints for text and image processing.")
-    
+
     parser.add_argument("endpoint", choices=["text", "image", "caption"], help="The endpoint to test.")
     parser.add_argument("input", help="Input text or image file path.")
     parser.add_argument("--model", help="Optional: Model alias to use.", default='clip')
-    
+
+    # Add an optional argument for max_length with a default value
+    parser.add_argument("--max_length", type=int, default=50, help="Optional: Specify the max_length for the captioning model.")
+
     args = parser.parse_args()
 
     # Determine which endpoint to test
@@ -107,4 +116,5 @@ if __name__ == "__main__":
         else:
             test_image_endpoint(args.input, args.model)
     elif args.endpoint == "caption":
-        test_caption_endpoint(args.input)
+        test_caption_endpoint(args.input, args.max_length)
+
