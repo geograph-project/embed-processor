@@ -1,0 +1,13 @@
+Docker Container, to provide microservices API for running encoding with varios Vision and text encoding models
+
+NOTE: This started from a docker container in the manticore image search demo
+https://github.com/manticoresoftware/manticore-image-search/tree/main/docker/containers/embed
+
+... That was only using TinyClip model, but we have extended to 
+
+* Use a full OpenAI Clip model. (we gone ahead with this for Geograph as a main model)
+* Add some text-only encoding models (a dedicated text model, works better for encoding tags etc, that lack visual similarity, eg proper names)
+* Experiment with a very small Gemma LLM model
+* And now adding Perception Encoder model
+
+
