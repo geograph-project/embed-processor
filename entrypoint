@@ -19,6 +19,8 @@ from transformers import (
 )
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import login
+import core.vision_encoder.pe as pe
+import core.vision_encoder.transforms as transforms
 
 # Get the token from the environment variable
 access_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -75,14 +77,18 @@ SUPPORTED_MODELS = {
         "type": "llm",
         "tokenizer_class": AutoTokenizer, #good enough for text llm
 	"model_class": AutoModelForCausalLM
-    }
+    },
 #    "gemma4b": {   -- running a full multimodel model is very differnet beast, likly not work without GPU
 #        "full_name": "google/gemma-3-4b-it",
 #        "type": "llm",
 #        "tokenizer_class": AutoTokenizer,
 #        "processor_class": AutoProcessor, #needed for multimodal
 #	"model_class": AutoModelForCausalLM
-#    }
+#    },
+    "pe": {
+        "full_name": "PE-Core-B16-224",
+        "type": "pe"
+    }
 }
 
 DEFAULT_CLIP_MODEL_ALIAS = "clip"
@@ -123,6 +129,12 @@ def load_model(alias_name: str):
             processor = model_info["processor_class"].from_pretrained(full_model_name)
             model = model_info["model_class"].from_pretrained(full_model_name)
             loaded_models[alias_name] = {"processor": processor, "model": model, "type": "caption"}
+
+        elif model_info["type"] == "pe":
+            model = pe.CLIP.from_config(full_model_name, pretrained=True)
+            preprocess = transforms.get_image_transform(model.image_size)
+            tokenizer = transforms.get_text_tokenizer(model.context_length)
+            loaded_models[alias_name] = {"model": model, "processor": preprocess, "tokenizer": tokenizer, "type": "pe"}
 
         elif model_info["type"] == "llm":
             # quantization would be for the larger models! (to load them into GPU!)
@@ -178,22 +190,29 @@ async def get_vector_from_image(request: ImageRequest):
     model_alias = request.model
     model_info = SUPPORTED_MODELS.get(model_alias)
 
-    if not model_info or model_info["type"] != "clip":
+    if not model_info or model_info["type"] not in ["clip", "pe"]:
         raise HTTPException(status_code=400, detail=f"Model '{model_alias}' does not support image encoding.")
 
     try:
-        clip_components = load_model(model_alias)
-        clip_processor = clip_components["processor"]
-        clip_model = clip_components["model"]
+        model_components = load_model(model_alias)
+        model = model_components["model"]
+        processor = model_components["processor"]
+        model_type = model_components["type"]
 
         image_bytes = base64.b64decode(request.image)
         image = Image.open(io.BytesIO(image_bytes))
 
-        inputs = clip_processor(images=image, return_tensors="pt")
-        with torch.no_grad():
-            image_features = clip_model.get_image_features(**inputs)
+        if model_type == "clip":
+            inputs = processor(images=image, return_tensors="pt")
+            with torch.no_grad():
+                image_features = model.get_image_features(**inputs)
+            return image_features.squeeze().tolist()
 
-        return image_features.squeeze().tolist()
+        elif model_type == "pe":
+            image_tensor = processor(image).unsqueeze(0)
+            with torch.no_grad():
+                image_features = model.encode_image(image_tensor)
+            return image_features.squeeze().tolist()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
@@ -219,6 +238,14 @@ async def get_vector_from_text(request: TextRequest):
             inputs = processor(text=[request.text], return_tensors="pt")
             with torch.no_grad():
                 text_features = model.get_text_features(**inputs)
+            return text_features.squeeze().tolist()
+
+        elif model_type == "pe":
+            tokenizer = model_components["tokenizer"]
+            model = model_components["model"]
+            text_tokens = tokenizer([request.text])
+            with torch.no_grad():
+                text_features = model.encode_text(text_tokens)
             return text_features.squeeze().tolist()
 
         elif model_type == "sentence_transformer":

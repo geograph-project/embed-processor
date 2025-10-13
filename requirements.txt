@@ -5,3 +5,6 @@ torch
 transformers
 python-multipart
 sentence-transformers
+decord
+ftfy
+git+https://github.com/facebookresearch/perception_models.git
