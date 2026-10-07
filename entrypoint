@@ -2,6 +2,7 @@
 import io
 import base64
 import torch
+import asyncio
 import uvicorn
 import concurrent.futures
 import os
@@ -14,8 +15,7 @@ from transformers import (
     CLIPModel,
     AutoProcessor,
     AutoModelForCausalLM,
-    AutoTokenizer,  # New import for LLM tokenizer
-    BitsAndBytesConfig  # New import for quantization
+    AutoTokenizer  # New import for LLM tokenizer
 )
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import login
@@ -24,9 +24,10 @@ import core.vision_encoder.transforms as transforms
 
 # Get the token from the environment variable
 access_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+offline_mode = os.environ.get("HF_HUB_OFFLINE") == "1"
 
 # Log in to Hugging Face
-if access_token:
+if access_token and not offline_mode:
     login(token=access_token)
 
 app = FastAPI()
@@ -38,6 +39,7 @@ MIN_DISK_SPACE = 1024 * 1024 * 1024 * 2 # 2 GB in bytes (clip - via transformers
 loaded_models = {}
 
 SUPPORTED_MODELS = {
+#image+text embedding models - for /image + /text APIs
     "clip": {
         "full_name": "openai/clip-vit-base-patch32",
         "type": "clip",
@@ -50,6 +52,11 @@ SUPPORTED_MODELS = {
         "processor_class": CLIPProcessor,
         "model_class": CLIPModel
     },
+    "pe": {
+        "full_name": "PE-Core-B16-224",
+        "type": "pe"
+    },
+#pure text embedding models - for /text API
     "bgesmall": {
         "full_name": "BAAI/bge-small-en-v1.5",
         "type": "sentence_transformer"
@@ -66,18 +73,20 @@ SUPPORTED_MODELS = {
         "full_name": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         "type": "sentence_transformer"
     },
+#image-to-text captioning model - for /caption API
     "git": {
         "full_name": "microsoft/git-base-coco",
         "type": "caption",
         "processor_class": AutoProcessor,
         "model_class": AutoModelForCausalLM
     },
+#generational LLM models - for /generate API
     "gemma270m": {
         "full_name": "google/gemma-3-270m-it",
         "type": "llm",
         "tokenizer_class": AutoTokenizer, #good enough for text llm
 	"model_class": AutoModelForCausalLM
-    },
+    }
 #    "gemma4b": {   -- running a full multimodel model is very differnet beast, likly not work without GPU
 #        "full_name": "google/gemma-3-4b-it",
 #        "type": "llm",
@@ -85,10 +94,6 @@ SUPPORTED_MODELS = {
 #        "processor_class": AutoProcessor, #needed for multimodal
 #	"model_class": AutoModelForCausalLM
 #    },
-    "pe": {
-        "full_name": "PE-Core-B16-224",
-        "type": "pe"
-    }
 }
 
 DEFAULT_CLIP_MODEL_ALIAS = "clip"
@@ -120,6 +125,12 @@ def load_model(alias_name: str):
             model = model_info["model_class"].from_pretrained(full_model_name)
             loaded_models[alias_name] = {"processor": processor, "model": model, "type": "clip"}
 
+        elif model_info["type"] == "pe":
+            model = pe.CLIP.from_config(full_model_name, pretrained=True)
+            preprocess = transforms.get_image_transform(model.image_size)
+            tokenizer = transforms.get_text_tokenizer(model.context_length)
+            loaded_models[alias_name] = {"model": model, "processor": preprocess, "tokenizer": tokenizer, "type": "pe"}
+
         elif model_info["type"] == "sentence_transformer":
             # Simplify loading by using the SentenceTransformer library
             model = SentenceTransformer(full_model_name)
@@ -129,12 +140,6 @@ def load_model(alias_name: str):
             processor = model_info["processor_class"].from_pretrained(full_model_name)
             model = model_info["model_class"].from_pretrained(full_model_name)
             loaded_models[alias_name] = {"processor": processor, "model": model, "type": "caption"}
-
-        elif model_info["type"] == "pe":
-            model = pe.CLIP.from_config(full_model_name, pretrained=True)
-            preprocess = transforms.get_image_transform(model.image_size)
-            tokenizer = transforms.get_text_tokenizer(model.context_length)
-            loaded_models[alias_name] = {"model": model, "processor": preprocess, "tokenizer": tokenizer, "type": "pe"}
 
         elif model_info["type"] == "llm":
             # quantization would be for the larger models! (to load them into GPU!)
@@ -292,8 +297,7 @@ async def generate_caption(request: ImageRequest, model_alias: str = "git"):
         raise HTTPException(status_code=500, detail=f"Error generating caption: {str(e)}")
 
 
-@app.post("/generate")
-async def generate_llm_response(request: LLMRequest):
+def run_llm_blocking(request: LLMRequest):
     if not request.text:
         raise HTTPException(status_code=400, detail="No text prompt provided.")
 
@@ -354,6 +358,24 @@ async def generate_llm_response(request: LLMRequest):
         raise HTTPException(status_code=400, detail=f"Error generating LLM response: {str(e)}")
 
 
+@app.post("/generate")
+async def generate_llm_response(request: LLMRequest):
+    """
+    This endpoint handles the LLM call asynchronously.
+    It offloads the blocking `run_llm_blocking` function to a separate thread
+    to keep the event loop free for other tasks, like the health check.
+    """
+    # Get the current event loop
+    loop = asyncio.get_event_loop()
+    # Use the default thread pool executor to run the blocking function
+    result = await loop.run_in_executor(
+        None,  # Use the default executor
+        run_llm_blocking,
+        request
+    )
+    return result
+
+
 @app.post("/multimodal-generate")
 async def multimodal_generate(request: LLMRequest):
     if not request.text and not request.image:
@@ -411,3 +433,4 @@ async def health_check():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
