@@ -103,6 +103,17 @@ SUPPORTED_MODELS = {
 
 DEFAULT_CLIP_MODEL_ALIAS = "clip"
 
+def _extract_embedding_tensor(out):
+    if hasattr(out, "text_embeds") and out.text_embeds is not None:
+        return out.text_embeds
+    if hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        return out.pooler_output
+    if isinstance(out, torch.Tensor):
+        return out
+    return out[0]
+
 def load_model(alias_name: str):
     """Loads a model and its corresponding components using the alias."""
     if alias_name not in loaded_models:
@@ -230,7 +241,8 @@ async def get_vector_from_image(request: ImageRequest):
             inputs = processor(images=image, return_tensors="pt")
             with torch.no_grad():
                 image_features = model.get_image_features(**inputs)
-            res = image_features.squeeze().tolist()
+            tensor = _extract_embedding_tensor(image_features)
+            res = tensor.squeeze().tolist()
             if request.dimensions:
                 res = res[:request.dimensions]
             return res
@@ -278,7 +290,8 @@ async def get_vector_from_text(request: TextRequest):
             inputs = processor(text=[request.text], return_tensors="pt")
             with torch.no_grad():
                 text_features = model.get_text_features(**inputs)
-            res = text_features.squeeze().tolist()
+            tensor = _extract_embedding_tensor(text_features)
+            res = tensor.squeeze().tolist()
             if request.dimensions:
                 res = res[:request.dimensions]
             return res
