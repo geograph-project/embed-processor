@@ -6,6 +6,7 @@ import uvicorn
 import concurrent.futures
 import os
 import shutil
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from PIL import Image
@@ -19,8 +20,12 @@ from transformers import (
 )
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import login
-import core.vision_encoder.pe as pe
-import core.vision_encoder.transforms as transforms
+try:
+    import core.vision_encoder.pe as pe
+    import core.vision_encoder.transforms as transforms
+except ImportError:
+    pe = None
+    transforms = None
 
 # Get the token from the environment variable
 access_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -88,6 +93,11 @@ SUPPORTED_MODELS = {
     "pe": {
         "full_name": "PE-Core-B16-224",
         "type": "pe"
+    },
+    "gemmaemb2": {
+        "full_name": "google/embeddinggemma-2",
+        "type": "sentence_transformer",
+        "config_kwargs": {"audio_config": None}
     }
 }
 
@@ -122,7 +132,11 @@ def load_model(alias_name: str):
 
         elif model_info["type"] == "sentence_transformer":
             # Simplify loading by using the SentenceTransformer library
-            model = SentenceTransformer(full_model_name)
+            config_kwargs = model_info.get("config_kwargs")
+            if config_kwargs:
+                model = SentenceTransformer(full_model_name, config_kwargs=config_kwargs)
+            else:
+                model = SentenceTransformer(full_model_name)
             loaded_models[alias_name] = {"model": model, "type": "sentence_transformer"}
 
         elif model_info["type"] == "caption":
@@ -168,12 +182,22 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
 # --- Pydantic Models ---
 class ImageRequest(BaseModel):
     image: str
-    model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a CLIP model alias for image encoding.")
+    model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a model alias for image encoding.")
     max_length: int = 50 # only used for caption endpoint
+    dimensions: Optional[int] = Query(None, description="Optional: Truncate embedding to given dimensions.")
 
 class TextRequest(BaseModel):
     text: str
     model: str = Query(DEFAULT_CLIP_MODEL_ALIAS, description="Optional: Specify a text embedding model alias.")
+    prompt_name: Optional[str] = Query(None, description="Optional: Specify prompt_name for model encoding (e.g. SearchQuery).")
+    dimensions: Optional[int] = Query(None, description="Optional: Truncate embedding to given dimensions.")
+
+class MultiRequest(BaseModel):
+    text: Optional[str] = None
+    image: Optional[str] = None
+    model: str = Query("gemmaemb2", description="Optional: Specify embedding model alias.")
+    prompt_name: Optional[str] = Query(None, description="Optional: Specify prompt_name for model encoding (e.g. SearchQuery).")
+    dimensions: Optional[int] = Query(None, description="Optional: Truncate embedding to given dimensions.")
 
 # New Pydantic class for LLM requests
 class LLMRequest(BaseModel):
@@ -190,29 +214,45 @@ async def get_vector_from_image(request: ImageRequest):
     model_alias = request.model
     model_info = SUPPORTED_MODELS.get(model_alias)
 
-    if not model_info or model_info["type"] not in ["clip", "pe"]:
+    if not model_info or model_info["type"] not in ["clip", "pe", "sentence_transformer"]:
         raise HTTPException(status_code=400, detail=f"Model '{model_alias}' does not support image encoding.")
 
     try:
         model_components = load_model(model_alias)
-        model = model_components["model"]
-        processor = model_components["processor"]
         model_type = model_components["type"]
 
         image_bytes = base64.b64decode(request.image)
-        image = Image.open(io.BytesIO(image_bytes))
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
         if model_type == "clip":
+            model = model_components["model"]
+            processor = model_components["processor"]
             inputs = processor(images=image, return_tensors="pt")
             with torch.no_grad():
                 image_features = model.get_image_features(**inputs)
-            return image_features.squeeze().tolist()
+            res = image_features.squeeze().tolist()
+            if request.dimensions:
+                res = res[:request.dimensions]
+            return res
 
         elif model_type == "pe":
+            model = model_components["model"]
+            processor = model_components["processor"]
             image_tensor = processor(image).unsqueeze(0)
             with torch.no_grad():
                 image_features = model.encode_image(image_tensor)
-            return image_features.squeeze().tolist()
+            res = image_features.squeeze().tolist()
+            if request.dimensions:
+                res = res[:request.dimensions]
+            return res
+
+        elif model_type == "sentence_transformer":
+            model = model_components["model"]
+            encode_kwargs = {"normalize_embeddings": True}
+            if request.dimensions:
+                encode_kwargs["truncate_dim"] = request.dimensions
+            embedding = model.encode({"image": image}, **encode_kwargs)
+            return embedding.tolist()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
@@ -238,7 +278,10 @@ async def get_vector_from_text(request: TextRequest):
             inputs = processor(text=[request.text], return_tensors="pt")
             with torch.no_grad():
                 text_features = model.get_text_features(**inputs)
-            return text_features.squeeze().tolist()
+            res = text_features.squeeze().tolist()
+            if request.dimensions:
+                res = res[:request.dimensions]
+            return res
 
         elif model_type == "pe":
             tokenizer = model_components["tokenizer"]
@@ -246,13 +289,19 @@ async def get_vector_from_text(request: TextRequest):
             text_tokens = tokenizer([request.text])
             with torch.no_grad():
                 text_features = model.encode_text(text_tokens)
-            return text_features.squeeze().tolist()
+            res = text_features.squeeze().tolist()
+            if request.dimensions:
+                res = res[:request.dimensions]
+            return res
 
         elif model_type == "sentence_transformer":
-            # This is the simplified part!
             model = model_components["model"]
-            # The encode method handles tokenization, forward pass, and pooling
-            embedding = model.encode(request.text, convert_to_tensor=False)
+            encode_kwargs = {"normalize_embeddings": True}
+            if request.dimensions:
+                encode_kwargs["truncate_dim"] = request.dimensions
+            if request.prompt_name:
+                encode_kwargs["prompt_name"] = request.prompt_name
+            embedding = model.encode(request.text, **encode_kwargs)
             return embedding.tolist()
 
         else:
@@ -260,6 +309,61 @@ async def get_vector_from_text(request: TextRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing text: {str(e)}")
+
+
+@app.post("/multi")
+async def get_vector_multimodal(request: MultiRequest):
+    if not request.text and not request.image:
+        raise HTTPException(status_code=400, detail="Please provide text or image data (or both).")
+
+    model_alias = request.model
+    model_info = SUPPORTED_MODELS.get(model_alias)
+
+    if not model_info:
+        raise HTTPException(status_code=400, detail=f"Model alias '{model_alias}' is not supported.")
+
+    try:
+        model_components = load_model(model_alias)
+        model_type = model_components["type"]
+
+        image_obj = None
+        if request.image:
+            image_bytes = base64.b64decode(request.image)
+            image_obj = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        if model_type == "sentence_transformer":
+            model = model_components["model"]
+            encode_kwargs = {"normalize_embeddings": True}
+            if request.dimensions:
+                encode_kwargs["truncate_dim"] = request.dimensions
+            if request.prompt_name:
+                encode_kwargs["prompt_name"] = request.prompt_name
+
+            if request.text and image_obj:
+                text_str = request.text
+                if "<|image|>" not in text_str:
+                    text_str = f"{text_str} <|image|>"
+                payload = {"text": text_str, "image": image_obj}
+            elif request.text:
+                payload = request.text
+            else:
+                payload = {"image": image_obj}
+
+            embedding = model.encode(payload, **encode_kwargs)
+            return embedding.tolist()
+
+        elif model_type in ["clip", "pe"]:
+            if request.text and not request.image:
+                return await get_vector_from_text(TextRequest(text=request.text, model=model_alias, dimensions=request.dimensions))
+            elif request.image and not request.text:
+                return await get_vector_from_image(ImageRequest(image=request.image, model=model_alias, dimensions=request.dimensions))
+            else:
+                raise HTTPException(status_code=400, detail=f"Model '{model_alias}' does not support interleaved text and image in a single embedding request.")
+        else:
+            raise HTTPException(status_code=400, detail=f"Model '{model_alias}' does not support multimodal embeddings.")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing multimodal request: {str(e)}")
 
 
 @app.post("/caption")
