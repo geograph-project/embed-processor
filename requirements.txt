@@ -7,4 +7,6 @@ python-multipart
 sentence-transformers[image,audio,video]
 decord
 ftfy
+einops
+timm
 git+https://github.com/facebookresearch/perception_models.git
