@@ -6,17 +6,21 @@ import os
 
 BASE_URL = "http://localhost:8000"
 
-def test_text_endpoint(input_text: str, model_alias: str):
+def test_text_endpoint(input_text: str, model_alias: str, prompt_name: str = None, dimensions: int = None):
     """Tests the /text endpoint with a given string and model alias."""
     print(f"Testing /text endpoint with model '{model_alias}'...")
     payload = {
         "text": input_text,
         "model": model_alias
     }
+    if prompt_name:
+        payload["prompt_name"] = prompt_name
+    if dimensions:
+        payload["dimensions"] = dimensions
     response = requests.post(f"{BASE_URL}/text", json=payload)
     handle_response(response)
 
-def test_image_endpoint(image_path: str, model_alias: str):
+def test_image_endpoint(image_path: str, model_alias: str, dimensions: int = None):
     """Tests the /image endpoint with a local image file and model alias."""
     print(f"Testing /image endpoint with model '{model_alias}'...")
     if not os.path.exists(image_path):
@@ -34,7 +38,36 @@ def test_image_endpoint(image_path: str, model_alias: str):
         "image": encoded_string,
         "model": model_alias
     }
+    if dimensions:
+        payload["dimensions"] = dimensions
     response = requests.post(f"{BASE_URL}/image", json=payload)
+    handle_response(response)
+
+def test_multi_endpoint(input_text: str, image_path: str, model_alias: str, prompt_name: str = None, dimensions: int = None):
+    """Tests the /multi endpoint with optional text and image."""
+    print(f"Testing /multi endpoint with model '{model_alias}'...")
+    payload = {
+        "model": model_alias
+    }
+    if input_text:
+        payload["text"] = input_text
+    if image_path:
+        if not os.path.exists(image_path):
+            print(f"Error: Image file not found at '{image_path}'")
+            return
+        try:
+            with open(image_path, "rb") as image_file:
+                payload["image"] = base64.b64encode(image_file.read()).decode('utf-8')
+        except IOError:
+            print(f"Error: Could not read image file at '{image_path}'")
+            return
+
+    if prompt_name:
+        payload["prompt_name"] = prompt_name
+    if dimensions:
+        payload["dimensions"] = dimensions
+
+    response = requests.post(f"{BASE_URL}/multi", json=payload)
     handle_response(response)
 
 def test_caption_endpoint(image_path: str, max_length: int):
@@ -95,9 +128,12 @@ def handle_response(response):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test FastAPI endpoints for text and image processing.")
 
-    parser.add_argument("endpoint", choices=["text", "image", "caption"], help="The endpoint to test.")
-    parser.add_argument("input", help="Input text or image file path.")
+    parser.add_argument("endpoint", choices=["text", "image", "caption", "multi"], help="The endpoint to test.")
+    parser.add_argument("input", nargs="?", default=None, help="Input text or image file path.")
+    parser.add_argument("--image", help="Optional image file path for multimodal request.")
     parser.add_argument("--model", help="Optional: Model alias to use.", default='clip')
+    parser.add_argument("--prompt_name", help="Optional: prompt_name to pass (e.g., SearchQuery).")
+    parser.add_argument("--dimensions", type=int, help="Optional: truncate dimension (e.g., 512, 256, 128).")
 
     # Add an optional argument for max_length with a default value
     parser.add_argument("--max_length", type=int, default=50, help="Optional: Specify the max_length for the captioning model.")
@@ -106,15 +142,20 @@ if __name__ == "__main__":
 
     # Determine which endpoint to test
     if args.endpoint == "text":
-        if not args.model:
-            print("Error: The 'text' endpoint requires a --model alias.")
+        if not args.input:
+            print("Error: The 'text' endpoint requires input text.")
         else:
-            test_text_endpoint(args.input, args.model)
+            test_text_endpoint(args.input, args.model, prompt_name=args.prompt_name, dimensions=args.dimensions)
     elif args.endpoint == "image":
-        if not args.model:
-            print("Error: The 'image' endpoint requires a --model alias.")
+        if not args.input:
+            print("Error: The 'image' endpoint requires an image input file path.")
         else:
-            test_image_endpoint(args.input, args.model)
+            test_image_endpoint(args.input, args.model, dimensions=args.dimensions)
+    elif args.endpoint == "multi":
+        test_multi_endpoint(args.input, args.image, args.model, prompt_name=args.prompt_name, dimensions=args.dimensions)
     elif args.endpoint == "caption":
-        test_caption_endpoint(args.input, args.max_length)
+        if not args.input:
+            print("Error: The 'caption' endpoint requires an image input file path.")
+        else:
+            test_caption_endpoint(args.input, args.max_length)
 
